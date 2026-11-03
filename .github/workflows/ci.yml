@@ -1,0 +1,134 @@
+
+name: Download and Decompile APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: apk-decompile-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  APK_URL: https://archive.org/download/que-apks/apks/com.ss.android.ttmd.video-47.5.3-arm64-v8a.apks
+  APK_FILE: application.apks
+  JADX_VERSION: "1.5.1"
+
+jobs:
+  decompile:
+    name: Download and Decompile
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            wget \
+            unzip \
+            zip \
+            default-jre
+
+      - name: Download APKS
+        run: |
+          set -euo pipefail
+
+          wget \
+            --progress=dot:giga \
+            --tries=3 \
+            --timeout=60 \
+            -O "$APK_FILE" \
+            "$APK_URL"
+
+          test -s "$APK_FILE"
+
+          echo "Downloaded:"
+          ls -lh "$APK_FILE"
+
+      - name: Extract APK
+        run: |
+          set -euo pipefail
+
+          mkdir -p extracted
+
+          unzip -t "$APK_FILE"
+          unzip -o "$APK_FILE" -d extracted
+
+          echo "APK files:"
+          find extracted -type f -name '*.apk'
+
+          if ! find extracted -type f -name '*.apk' | grep -q .; then
+            echo "::error::No APK files found in archive."
+            exit 1
+          fi
+
+      - name: Install JADX
+        run: |
+          set -euo pipefail
+
+          JADX_URL="https://github.com/skylot/jadx/releases/download/v${JADX_VERSION}/jadx-${JADX_VERSION}.zip"
+
+          wget -q "$JADX_URL" -O jadx.zip
+
+          mkdir -p jadx
+          unzip -q jadx.zip -d jadx
+
+          chmod +x jadx/bin/jadx
+
+          jadx/bin/jadx --version
+
+      - name: Decompile APK
+        run: |
+          set -euo pipefail
+
+          mkdir -p decompiled
+
+          APK_COUNT=0
+
+          while IFS= read -r -d '' APK; do
+            APK_COUNT=$((APK_COUNT + 1))
+
+            APK_NAME=$(basename "$APK" .apk)
+            OUTPUT="decompiled/$APK_NAME"
+
+            echo "Decompiling: $APK"
+
+            mkdir -p "$OUTPUT"
+
+            jadx/bin/jadx \
+              --no-res \
+              --show-bad-code \
+              -d "$OUTPUT" \
+              "$APK"
+
+          done < <(find extracted -type f -name '*.apk' -print0)
+
+          if [ "$APK_COUNT" -eq 0 ]; then
+            echo "::error::No APK files to decompile."
+            exit 1
+          fi
+
+          echo "Successfully processed $APK_COUNT APK file(s)."
+
+      - name: Upload Decompiled Sources
+        uses: actions/upload-artifact@v4
+        with:
+          name: decompiled-sources
+          path: decompiled/
+          if-no-files-found: error
+          compression-level: 6
+          retention-days: 14
+
+      - name: Upload Original APKS
+        uses: actions/upload-artifact@v4
+        with:
+          name: original-apks
+          path: application.apks
+          if-no-files-found: error
+          retention-days: 14
