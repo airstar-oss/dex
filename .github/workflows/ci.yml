@@ -1,4 +1,4 @@
-name: Download and Decompile APK
+name: Decompile Base APK
 
 on:
   workflow_dispatch:
@@ -10,7 +10,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: apk-decompile-${{ github.ref }}
+  group: jadx-${{ github.ref }}
   cancel-in-progress: true
 
 env:
@@ -21,13 +21,16 @@ jobs:
   decompile:
     name: Decompile Base APK
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 90
 
     steps:
       - name: Install Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y wget unzip default-jre
+          sudo apt-get install -y \
+            wget \
+            unzip \
+            openjdk-17-jre-headless
 
       - name: Download APKS
         run: |
@@ -36,6 +39,7 @@ jobs:
           wget \
             --tries=3 \
             --timeout=60 \
+            --progress=dot:giga \
             -O application.apks \
             "$APK_URL"
 
@@ -43,79 +47,113 @@ jobs:
           unzip -t application.apks
 
       - name: Extract Base APK
+        shell: bash
         run: |
           set -euo pipefail
 
           mkdir -p extracted
 
-          BASE_ENTRY=$(unzip -Z1 application.apks | grep -E '(^|/)base\.apk$' | head -n 1 || true)
+          BASE_ENTRY=$(
+            unzip -Z1 application.apks |
+              awk 'tolower($0) ~ /(^|\/)base\.apk$/ { print; exit }'
+          )
 
-          if [ -z "$BASE_ENTRY" ]; then
-            echo "::error::base.apk not found in APKS archive."
-            echo "Archive contents:"
-            unzip -Z1 application.apks
+          if [[ -z "$BASE_ENTRY" ]]; then
+            echo "::error::base.apk not found."
             exit 1
           fi
 
-          echo "Found: $BASE_ENTRY"
+          echo "Extracting: $BASE_ENTRY"
 
           unzip -p application.apks "$BASE_ENTRY" > extracted/base.apk
 
-          if [ ! -s extracted/base.apk ]; then
-            echo "::error::Extracted base.apk is empty."
-            exit 1
-          fi
+          test -s extracted/base.apk
 
-          file extracted/base.apk
           ls -lh extracted/base.apk
 
       - name: Install JADX
         run: |
           set -euo pipefail
 
-          JADX_URL="https://github.com/skylot/jadx/releases/download/v${JADX_VERSION}/jadx-${JADX_VERSION}.zip"
+          URL="https://github.com/skylot/jadx/releases/download/v${JADX_VERSION}/jadx-${JADX_VERSION}.zip"
 
-          wget -q "$JADX_URL" -O jadx.zip
+          wget -q "$URL" -O jadx.zip
 
           mkdir -p jadx
           unzip -q jadx.zip -d jadx
+
           chmod +x jadx/bin/jadx
 
           jadx/bin/jadx --version
 
-      - name: Decompile Base APK
+      - name: Decompile Source and Resources
+        env:
+          JAVA_TOOL_OPTIONS: >-
+            -Xms256m
+            -Xmx4g
+            -XX:+UseG1GC
         run: |
           set -euo pipefail
 
-          mkdir -p decompiled
+          mkdir -p decompiled/sources
+          mkdir -p decompiled/resources
+
+          echo "Starting JADX..."
+          echo "Threads: 2"
+          echo "Heap: 4 GB"
 
           jadx/bin/jadx \
-            --show-bad-code \
+            --threads-count 2 \
             --decompilation-mode auto \
-            -d decompiled \
-            extracted/base.apk
+            --log-level WARN \
+            --output-dir-src decompiled/sources \
+            --output-dir-res decompiled/resources \
+            extracted/base.apk \
+            2>&1 | tee jadx.log
 
-          if [ ! -d decompiled/sources ] && [ ! -d decompiled/resources ]; then
-            echo "::error::JADX did not generate source or resource output."
+          echo "JADX process completed."
+
+          if ! find decompiled/sources -type f -name '*.java' -print -quit | grep -q .; then
+            echo "::error::No Java source files generated."
             exit 1
           fi
 
-          echo "Decompilation completed."
+          if [[ ! -d decompiled/resources ]]; then
+            echo "::error::Resource directory missing."
+            exit 1
+          fi
+
+          echo "Source files:"
+          find decompiled/sources -type f | wc -l
+
+          echo "Resource files:"
+          find decompiled/resources -type f | wc -l
+
           du -sh decompiled
 
-      - name: Upload Decompiled Sources and Resources
+      - name: Upload Decompiled Sources
         uses: actions/upload-artifact@v4
         with:
-          name: base-apk-decompiled
-          path: decompiled/
+          name: decompiled-sources
+          path: decompiled/sources/
           if-no-files-found: error
           compression-level: 6
           retention-days: 14
 
-      - name: Upload Original Base APK
+      - name: Upload Decompiled Resources
         uses: actions/upload-artifact@v4
         with:
-          name: base-apk
-          path: extracted/base.apk
+          name: decompiled-resources
+          path: decompiled/resources/
           if-no-files-found: error
+          compression-level: 6
           retention-days: 14
+
+      - name: Upload JADX Log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: jadx-log
+          path: jadx.log
+          if-no-files-found: ignore
+          retention-days: 7
