@@ -1,4 +1,3 @@
-
 name: Download and Decompile APK
 
 on:
@@ -16,12 +15,11 @@ concurrency:
 
 env:
   APK_URL: https://archive.org/download/que-apks/apks/com.ss.android.ttmd.video-47.5.3-arm64-v8a.apks
-  APK_FILE: application.apks
   JADX_VERSION: "1.5.1"
 
 jobs:
   decompile:
-    name: Download and Decompile
+    name: Decompile Base APK
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
@@ -29,44 +27,47 @@ jobs:
       - name: Install Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
-            wget \
-            unzip \
-            zip \
-            default-jre
+          sudo apt-get install -y wget unzip default-jre
 
       - name: Download APKS
         run: |
           set -euo pipefail
 
           wget \
-            --progress=dot:giga \
             --tries=3 \
             --timeout=60 \
-            -O "$APK_FILE" \
+            -O application.apks \
             "$APK_URL"
 
-          test -s "$APK_FILE"
+          test -s application.apks
+          unzip -t application.apks
 
-          echo "Downloaded:"
-          ls -lh "$APK_FILE"
-
-      - name: Extract APK
+      - name: Extract Base APK
         run: |
           set -euo pipefail
 
           mkdir -p extracted
 
-          unzip -t "$APK_FILE"
-          unzip -o "$APK_FILE" -d extracted
+          BASE_ENTRY=$(unzip -Z1 application.apks | grep -E '(^|/)base\.apk$' | head -n 1 || true)
 
-          echo "APK files:"
-          find extracted -type f -name '*.apk'
-
-          if ! find extracted -type f -name '*.apk' | grep -q .; then
-            echo "::error::No APK files found in archive."
+          if [ -z "$BASE_ENTRY" ]; then
+            echo "::error::base.apk not found in APKS archive."
+            echo "Archive contents:"
+            unzip -Z1 application.apks
             exit 1
           fi
+
+          echo "Found: $BASE_ENTRY"
+
+          unzip -p application.apks "$BASE_ENTRY" > extracted/base.apk
+
+          if [ ! -s extracted/base.apk ]; then
+            echo "::error::Extracted base.apk is empty."
+            exit 1
+          fi
+
+          file extracted/base.apk
+          ls -lh extracted/base.apk
 
       - name: Install JADX
         run: |
@@ -78,57 +79,43 @@ jobs:
 
           mkdir -p jadx
           unzip -q jadx.zip -d jadx
-
           chmod +x jadx/bin/jadx
 
           jadx/bin/jadx --version
 
-      - name: Decompile APK
+      - name: Decompile Base APK
         run: |
           set -euo pipefail
 
           mkdir -p decompiled
 
-          APK_COUNT=0
+          jadx/bin/jadx \
+            --show-bad-code \
+            --decompilation-mode auto \
+            -d decompiled \
+            extracted/base.apk
 
-          while IFS= read -r -d '' APK; do
-            APK_COUNT=$((APK_COUNT + 1))
-
-            APK_NAME=$(basename "$APK" .apk)
-            OUTPUT="decompiled/$APK_NAME"
-
-            echo "Decompiling: $APK"
-
-            mkdir -p "$OUTPUT"
-
-            jadx/bin/jadx \
-              --no-res \
-              --show-bad-code \
-              -d "$OUTPUT" \
-              "$APK"
-
-          done < <(find extracted -type f -name '*.apk' -print0)
-
-          if [ "$APK_COUNT" -eq 0 ]; then
-            echo "::error::No APK files to decompile."
+          if [ ! -d decompiled/sources ] && [ ! -d decompiled/resources ]; then
+            echo "::error::JADX did not generate source or resource output."
             exit 1
           fi
 
-          echo "Successfully processed $APK_COUNT APK file(s)."
+          echo "Decompilation completed."
+          du -sh decompiled
 
-      - name: Upload Decompiled Sources
+      - name: Upload Decompiled Sources and Resources
         uses: actions/upload-artifact@v4
         with:
-          name: decompiled-sources
+          name: base-apk-decompiled
           path: decompiled/
           if-no-files-found: error
           compression-level: 6
           retention-days: 14
 
-      - name: Upload Original APKS
+      - name: Upload Original Base APK
         uses: actions/upload-artifact@v4
         with:
-          name: original-apks
-          path: application.apks
+          name: base-apk
+          path: extracted/base.apk
           if-no-files-found: error
           retention-days: 14
