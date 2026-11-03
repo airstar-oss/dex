@@ -1,4 +1,4 @@
-name: Decompile Base APK
+name: Prepare APK for JADX-GUI
 
 on:
   workflow_dispatch:
@@ -10,28 +10,32 @@ permissions:
   contents: read
 
 concurrency:
-  group: jadx-${{ github.ref }}
+  group: jadx-split-${{ github.ref }}
   cancel-in-progress: true
 
 env:
   APK_URL: https://archive.org/download/que-apks/apks/com.ss.android.ttmd.video-47.5.3-arm64-v8a.apks
-  JADX_VERSION: "1.5.1"
 
 jobs:
-  decompile:
-    name: Decompile Base APK
+  prepare:
+    name: Extract and Split Base DEX
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 20
 
     steps:
+      # -----------------------------------------------
+      # 1. Install dependencies
+      # -----------------------------------------------
       - name: Install Dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            wget \
-            unzip \
-            openjdk-17-jre-headless
+          set -euo pipefail
 
+          sudo apt-get update
+          sudo apt-get install -y wget unzip zip python3
+
+      # -----------------------------------------------
+      # 2. Download APKS
+      # -----------------------------------------------
       - name: Download APKS
         run: |
           set -euo pipefail
@@ -44,10 +48,15 @@ jobs:
             "$APK_URL"
 
           test -s application.apks
+
           unzip -t application.apks
 
+          ls -lh application.apks
+
+      # -----------------------------------------------
+      # 3. Extract base.apk
+      # -----------------------------------------------
       - name: Extract Base APK
-        shell: bash
         run: |
           set -euo pipefail
 
@@ -65,95 +74,253 @@ jobs:
 
           echo "Extracting: $BASE_ENTRY"
 
-          unzip -p application.apks "$BASE_ENTRY" > extracted/base.apk
+          unzip -p application.apks "$BASE_ENTRY" \
+            > extracted/base.apk
 
           test -s extracted/base.apk
 
+          echo "=== Base APK ==="
           ls -lh extracted/base.apk
 
-      - name: Install JADX
+      # -----------------------------------------------
+      # 4. Inspect DEX
+      # -----------------------------------------------
+      - name: Inspect Base APK
         run: |
           set -euo pipefail
 
-          URL="https://github.com/skylot/jadx/releases/download/v${JADX_VERSION}/jadx-${JADX_VERSION}.zip"
+          echo "=== APK Information ==="
+          file extracted/base.apk
 
-          wget -q "$URL" -O jadx.zip
+          echo "=== DEX Files ==="
 
-          mkdir -p jadx
-          unzip -q jadx.zip -d jadx
+          unzip -Z1 extracted/base.apk |
+            grep -E '^classes[0-9]*\.dex$' || true
 
-          chmod +x jadx/bin/jadx
+          echo "=== DEX Count ==="
 
-          jadx/bin/jadx --version
+          unzip -Z1 extracted/base.apk |
+            grep -Ec '^classes[0-9]*\.dex$' || true
 
-      - name: Decompile Source and Resources
-        env:
-          JAVA_TOOL_OPTIONS: >-
-            -Xms256m
-            -Xmx4g
-            -XX:+UseG1GC
+          echo "=== Memory ==="
+          free -h
+
+      # -----------------------------------------------
+      # 5. Split DEX and preserve resources
+      # -----------------------------------------------
+      - name: Split DEX and Package Resources
         run: |
           set -euo pipefail
 
-          mkdir -p decompiled/sources
-          mkdir -p decompiled/resources
+          mkdir -p output/per-dex
 
-          echo "Starting JADX..."
-          echo "Threads: 2"
-          echo "Heap: 4 GB"
+          python3 - <<'PY'
+          import re
+          import zipfile
+          from pathlib import Path
 
-          jadx/bin/jadx \
-            --threads-count 2 \
-            --decompilation-mode auto \
-            --log-level WARN \
-            --output-dir-src decompiled/sources \
-            --output-dir-res decompiled/resources \
-            extracted/base.apk \
-            2>&1 | tee jadx.log
+          source = Path("extracted/base.apk")
+          output = Path("output")
+          dex_dir = output / "per-dex"
 
-          echo "JADX process completed."
+          dex_pattern = re.compile(r"^classes([0-9]*)\.dex$", re.I)
 
-          if ! find decompiled/sources -type f -name '*.java' -print -quit | grep -q .; then
-            echo "::error::No Java source files generated."
-            exit 1
-          fi
+          def is_dex(name):
+              return bool(dex_pattern.fullmatch(name))
 
-          if [[ ! -d decompiled/resources ]]; then
-            echo "::error::Resource directory missing."
-            exit 1
-          fi
+          def is_signature(name):
+              name = name.upper()
 
-          echo "Source files:"
-          find decompiled/sources -type f | wc -l
+              if not name.startswith("META-INF/"):
+                  return False
 
-          echo "Resource files:"
-          find decompiled/resources -type f | wc -l
+              return (
+                  name == "META-INF/MANIFEST.MF"
+                  or name.endswith((".SF", ".RSA", ".DSA", ".EC"))
+              )
 
-          du -sh decompiled
+          def is_shared(name):
+              return not is_dex(name) and not is_signature(name)
 
-      - name: Upload Decompiled Sources
+          with zipfile.ZipFile(source, "r") as apk:
+              entries = apk.infolist()
+
+              dex_entries = [
+                  info for info in entries
+                  if "/" not in info.filename
+                  and is_dex(info.filename)
+              ]
+
+              dex_entries.sort(
+                  key=lambda info: (
+                      int(dex_pattern.fullmatch(info.filename).group(1) or 1),
+                      info.filename.lower()
+                  )
+              )
+
+              if not dex_entries:
+                  raise SystemExit("ERROR: No DEX files found.")
+
+              if "AndroidManifest.xml" not in apk.namelist():
+                  raise SystemExit("ERROR: AndroidManifest.xml missing.")
+
+              shared_entries = [
+                  info for info in entries
+                  if is_shared(info.filename)
+              ]
+
+              print(f"DEX count: {len(dex_entries)}")
+              print(f"Shared entries: {len(shared_entries)}")
+
+              # Create a resource/shared-files archive.
+              resources_zip = output / "base-apk-resources.zip"
+
+              with zipfile.ZipFile(
+                  resources_zip,
+                  "w",
+                  compression=zipfile.ZIP_DEFLATED,
+                  compresslevel=6
+              ) as resources:
+                  for info in shared_entries:
+                      resources.writestr(
+                          info,
+                          apk.read(info)
+                      )
+
+              # Create one JADX-GUI input APK per DEX.
+              for index, dex_info in enumerate(dex_entries, 1):
+                  original_name = dex_info.filename
+
+                  destination = (
+                      dex_dir /
+                      f"base-dex-{index:02d}.apk"
+                  )
+
+                  print(f"Creating: {destination}")
+                  print(f"Original DEX: {original_name}")
+
+                  with zipfile.ZipFile(
+                      destination,
+                      "w",
+                      compression=zipfile.ZIP_DEFLATED,
+                      compresslevel=6
+                  ) as result:
+
+                      # Preserve manifest, resources, assets and
+                      # other non-DEX entries.
+                      for info in shared_entries:
+                          result.writestr(
+                              info,
+                              apk.read(info)
+                          )
+
+                      # Normalize the selected DEX to classes.dex.
+                      normalized = zipfile.ZipInfo(
+                          "classes.dex",
+                          date_time=dex_info.date_time
+                      )
+
+                      normalized.compress_type = zipfile.ZIP_DEFLATED
+
+                      result.writestr(
+                          normalized,
+                          apk.read(dex_info)
+                      )
+
+                  # Verify the generated archive.
+                  with zipfile.ZipFile(destination, "r") as check:
+                      bad_file = check.testzip()
+
+                      if bad_file:
+                          raise SystemExit(
+                              f"Corrupt entry in {destination}: {bad_file}"
+                          )
+
+                      dex_files = [
+                          name for name in check.namelist()
+                          if is_dex(name)
+                      ]
+
+                      if dex_files != ["classes.dex"]:
+                          raise SystemExit(
+                              f"Unexpected DEX entries: {dex_files}"
+                          )
+
+                  print(
+                      f"Created: {destination} "
+                      f"({destination.stat().st_size / 1024 / 1024:.2f} MiB)"
+                  )
+
+          # Create documentation.
+          readme = output / "README.txt"
+
+          readme.write_text(
+              """JADX-GUI PER-DEX INPUTS
+
+          per-dex/
+            Each APK contains exactly one DEX file.
+            All original non-DEX entries are preserved.
+
+          base-apk-resources.zip
+            Shared Android resources and manifest.
+
+          HOW TO USE
+
+          1. Extract this artifact.
+          2. Open JADX-GUI.
+          3. Open one APK from per-dex/.
+          4. Analyze the DEX independently.
+          5. Repeat for other DEX files.
+
+          IMPORTANT
+
+          These are analysis-only APK containers.
+          They are not intended for Android installation.
+
+          Cross-DEX references may be unresolved because
+          each container contains only one DEX.
+
+          Resources are duplicated into each container
+          to allow JADX-GUI to inspect them independently.
+          """,
+              encoding="utf-8"
+          )
+
+          print("\nDEX splitting completed successfully.")
+          PY
+
+      # -----------------------------------------------
+      # 6. Display output
+      # -----------------------------------------------
+      - name: Display Output
+        run: |
+          set -euo pipefail
+
+          echo "=== Generated Files ==="
+          find output -type f -printf '%p (%k KB)\n'
+
+          echo "=== Total Size ==="
+          du -sh output/
+
+      # -----------------------------------------------
+      # 7. Upload JADX-GUI inputs
+      # -----------------------------------------------
+      - name: Upload JADX-GUI Inputs
         uses: actions/upload-artifact@v4
         with:
-          name: decompiled-sources
-          path: decompiled/sources/
+          name: jadx-gui-inputs
+          path: output/
           if-no-files-found: error
           compression-level: 6
           retention-days: 14
 
-      - name: Upload Decompiled Resources
+      # -----------------------------------------------
+      # 8. Upload original APK
+      # -----------------------------------------------
+      - name: Upload Original Base APK
         uses: actions/upload-artifact@v4
         with:
-          name: decompiled-resources
-          path: decompiled/resources/
+          name: original-base-apk
+          path: extracted/base.apk
           if-no-files-found: error
-          compression-level: 6
           retention-days: 14
-
-      - name: Upload JADX Log
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: jadx-log
-          path: jadx.log
-          if-no-files-found: ignore
-          retention-days: 7
